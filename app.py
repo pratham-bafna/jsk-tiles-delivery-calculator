@@ -2,6 +2,7 @@ import os
 import requests
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -29,7 +30,7 @@ ORIGIN_LONGITUDE = float(
 
 ORIGIN_NAME = os.getenv(
     "ORIGIN_NAME",
-    "JSK Tiles World"
+    "Delivery Warehouse"
 )
 
 
@@ -37,9 +38,8 @@ ORIGIN_NAME = os.getenv(
 # PLACEHOLDER PRICING
 #
 # IMPORTANT:
-# These are NOT real JSK delivery rates.
-# Replace them once the actual transporter pricing
-# is available.
+# This is NOT a real delivery rate.
+# Replace it with the actual pricing model later.
 # ============================================================
 
 PLACEHOLDER_RATE_PER_KG_KM = 0.50
@@ -50,9 +50,34 @@ PLACEHOLDER_RATE_PER_KG_KM = 0.50
 # ============================================================
 
 app = FastAPI(
-    title="JSK Tiles World Delivery Calculator",
-    description="PIN, distance, weight and delivery charge calculator",
-    version="3.0.0"
+    title="E-Commerce Delivery Charge Calculator",
+    description=(
+        "API for calculating delivery charges using "
+        "PIN code, driving distance, and shipment weight."
+    ),
+    version="4.0.0"
+)
+
+
+# ============================================================
+# CORS
+#
+# This allows a web frontend, including an e-commerce
+# storefront, to communicate with this API.
+#
+# For development we allow all origins.
+# This should be restricted to the actual website domain
+# before production deployment.
+# ============================================================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://jsktilesworld.squarespace.com"
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -60,7 +85,7 @@ app = FastAPI(
 # REQUEST MODEL
 # ============================================================
 
-class DistanceRequest(BaseModel):
+class DeliveryRequest(BaseModel):
 
     pincode: str = Field(
         ...,
@@ -72,7 +97,7 @@ class DistanceRequest(BaseModel):
         ...,
         gt=0,
         description="Total shipment weight in kilograms",
-        examples=[500]
+        examples=[154]
     )
 
 
@@ -85,24 +110,20 @@ class DistanceRequest(BaseModel):
 def geocode_pincode(pincode: str):
 
     if not GOOGLE_MAPS_API_KEY:
-
         raise HTTPException(
             status_code=500,
             detail="GOOGLE_MAPS_API_KEY is not configured"
         )
-
 
     url = (
         "https://maps.googleapis.com/"
         "maps/api/geocode/json"
     )
 
-
     params = {
         "address": f"{pincode}, India",
         "key": GOOGLE_MAPS_API_KEY
     }
-
 
     try:
 
@@ -125,25 +146,20 @@ def geocode_pincode(pincode: str):
 
         data = response.json()
 
-
     except requests.RequestException as exc:
 
         raise HTTPException(
             status_code=502,
             detail={
-                "message":
-                    "Google Geocoding API request failed",
-
-                "error":
-                    str(exc),
-
-                "google_response":
+                "message": "Google Geocoding API request failed",
+                "error": str(exc),
+                "google_response": (
                     response.text
                     if "response" in locals()
                     else None
+                )
             }
         )
-
 
     # --------------------------------------------------------
     # Check Google response
@@ -151,43 +167,29 @@ def geocode_pincode(pincode: str):
 
     status = data.get("status")
 
-
     if status != "OK":
 
         raise HTTPException(
             status_code=404,
             detail={
-                "message":
-                    "Google could not find this PIN code",
-
-                "pincode":
-                    pincode,
-
-                "google_status":
-                    status,
-
-                "google_error":
-                    data.get("error_message")
+                "message": "Google could not find this PIN code",
+                "pincode": pincode,
+                "google_status": status,
+                "google_error": data.get("error_message")
             }
         )
 
-
     results = data.get("results", [])
-
 
     if not results:
 
         raise HTTPException(
             status_code=404,
             detail={
-                "message":
-                    "No location found for this PIN code",
-
-                "pincode":
-                    pincode
+                "message": "No location found for this PIN code",
+                "pincode": pincode
             }
         )
-
 
     # --------------------------------------------------------
     # Use first Google result
@@ -204,20 +206,18 @@ def geocode_pincode(pincode: str):
         "location"
     )
 
-
     if not location:
 
         raise HTTPException(
             status_code=502,
             detail={
-                "message":
-                    "Google returned a result without coordinates",
-
-                "google_result":
-                    result
+                "message": (
+                    "Google returned a result "
+                    "without coordinates"
+                ),
+                "google_result": result
             }
         )
-
 
     return {
 
@@ -262,12 +262,10 @@ def calculate_google_route(
             detail="GOOGLE_MAPS_API_KEY is not configured"
         )
 
-
     url = (
         "https://routes.googleapis.com/"
         "directions/v2:computeRoutes"
     )
-
 
     # --------------------------------------------------------
     # Origin
@@ -288,7 +286,6 @@ def calculate_google_route(
         }
     }
 
-
     # --------------------------------------------------------
     # Destination
     # --------------------------------------------------------
@@ -307,7 +304,6 @@ def calculate_google_route(
             }
         }
     }
-
 
     # --------------------------------------------------------
     # Google Routes request
@@ -337,7 +333,6 @@ def calculate_google_route(
             "METRIC"
     }
 
-
     headers = {
 
         "Content-Type":
@@ -349,7 +344,6 @@ def calculate_google_route(
         "X-Goog-FieldMask":
             "routes.distanceMeters,routes.duration"
     }
-
 
     try:
 
@@ -373,30 +367,25 @@ def calculate_google_route(
 
         data = response.json()
 
-
     except requests.RequestException as exc:
 
         raise HTTPException(
             status_code=502,
             detail={
-                "message":
-                    "Google Routes API request failed",
-
-                "error":
-                    str(exc),
-
-                "google_http_status":
+                "message": "Google Routes API request failed",
+                "error": str(exc),
+                "google_http_status": (
                     response.status_code
                     if "response" in locals()
-                    else None,
-
-                "google_response":
+                    else None
+                ),
+                "google_response": (
                     response.text
                     if "response" in locals()
                     else None
+                )
             }
         )
-
 
     # --------------------------------------------------------
     # Check routes
@@ -404,23 +393,17 @@ def calculate_google_route(
 
     routes = data.get("routes")
 
-
     if not routes:
 
         raise HTTPException(
             status_code=502,
             detail={
-                "message":
-                    "Google returned no routes",
-
-                "google_response":
-                    data
+                "message": "Google returned no routes",
+                "google_response": data
             }
         )
 
-
     route = routes[0]
-
 
     # --------------------------------------------------------
     # Get distance
@@ -430,20 +413,18 @@ def calculate_google_route(
         "distanceMeters"
     )
 
-
     if distance_meters is None:
 
         raise HTTPException(
             status_code=502,
             detail={
-                "message":
-                    "Google returned a route but no distance",
-
-                "route":
-                    route
+                "message": (
+                    "Google returned a route "
+                    "but no distance"
+                ),
+                "route": route
             }
         )
-
 
     return {
 
@@ -462,7 +443,10 @@ def calculate_google_route(
 
 
 # ============================================================
-# PLACEHOLDER DELIVERY CALCULATION
+# DELIVERY PRICING
+#
+# This is currently a placeholder.
+# The actual pricing model will be added later.
 # ============================================================
 
 def calculate_delivery_charge(
@@ -480,7 +464,6 @@ def calculate_delivery_charge(
     # 100 km × 500 kg × ₹0.50
     # = ₹25,000
     #
-    # THIS IS ONLY A PLACEHOLDER.
     # --------------------------------------------------------
 
     charge = (
@@ -489,8 +472,16 @@ def calculate_delivery_charge(
         * PLACEHOLDER_RATE_PER_KG_KM
     )
 
-
     return {
+
+        "delivery_charge":
+            round(charge, 2),
+
+        "currency":
+            "INR",
+
+        "is_placeholder":
+            True,
 
         "rate_per_kg_km":
             PLACEHOLDER_RATE_PER_KG_KM,
@@ -500,16 +491,7 @@ def calculate_delivery_charge(
                 f"{distance_km} km × "
                 f"{weight_kg} kg × "
                 f"₹{PLACEHOLDER_RATE_PER_KG_KM}/kg/km"
-            ),
-
-        "delivery_charge":
-            round(charge, 2),
-
-        "currency":
-            "INR",
-
-        "is_placeholder":
-            True
+            )
     }
 
 
@@ -523,10 +505,10 @@ def home():
     return {
 
         "application":
-            "JSK Tiles World Delivery Calculator",
+            "E-Commerce Delivery Charge Calculator",
 
         "version":
-            "3.0.0",
+            "4.0.0",
 
         "status":
             "running",
@@ -543,12 +525,12 @@ def home():
                     ORIGIN_LONGITUDE
             },
 
-        "placeholder_pricing":
+        "pricing":
             {
                 "rate_per_kg_km":
                     PLACEHOLDER_RATE_PER_KG_KM,
 
-                "enabled":
+                "placeholder":
                     True
             },
 
@@ -557,8 +539,8 @@ def home():
                 "health":
                     "/health",
 
-                "calculate":
-                    "POST /distance",
+                "calculate_delivery":
+                    "POST /calculate-delivery",
 
                 "documentation":
                     "/docs"
@@ -607,18 +589,27 @@ def health():
 
 
 # ============================================================
-# MAIN CALCULATION ENDPOINT
+# DELIVERY CALCULATION ENDPOINT
+#
+# POST /calculate-delivery
+#
+# Example request:
+#
+# {
+#     "pincode": "641001",
+#     "weight_kg": 154
+# }
+#
 # ============================================================
 
-@app.post("/distance")
-def distance(request: DistanceRequest):
+@app.post("/calculate-delivery")
+def calculate_delivery(request: DeliveryRequest):
 
     # --------------------------------------------------------
     # Clean PIN
     # --------------------------------------------------------
 
     pincode = request.pincode.strip()
-
 
     # --------------------------------------------------------
     # Validate PIN
@@ -631,14 +622,12 @@ def distance(request: DistanceRequest):
             detail="PIN code must contain only numbers"
         )
 
-
     if len(pincode) != 6:
 
         raise HTTPException(
             status_code=400,
             detail="PIN code must contain exactly 6 digits"
         )
-
 
     # --------------------------------------------------------
     # Validate weight
@@ -651,7 +640,6 @@ def distance(request: DistanceRequest):
             detail="Weight must be greater than 0 kg"
         )
 
-
     # --------------------------------------------------------
     # STEP 1
     #
@@ -661,7 +649,6 @@ def distance(request: DistanceRequest):
     location = geocode_pincode(
         pincode
     )
-
 
     # --------------------------------------------------------
     # STEP 2
@@ -678,7 +665,6 @@ def distance(request: DistanceRequest):
             location["longitude"]
     )
 
-
     # --------------------------------------------------------
     # STEP 3
     #
@@ -694,24 +680,29 @@ def distance(request: DistanceRequest):
             request.weight_kg
     )
 
-
     # --------------------------------------------------------
-    # FINAL RESPONSE
+    # FINAL E-COMMERCE-FRIENDLY RESPONSE
     # --------------------------------------------------------
 
     return {
 
-        "status":
-            "success",
+        "success":
+            True,
 
         "pincode":
             pincode,
 
-        "shipment":
-            {
-                "weight_kg":
-                    request.weight_kg
-            },
+        "weight_kg":
+            request.weight_kg,
+
+        "distance_km":
+            route["distance_km"],
+
+        "delivery_charge":
+            pricing["delivery_charge"],
+
+        "currency":
+            pricing["currency"],
 
         "origin":
             {
@@ -740,18 +731,24 @@ def distance(request: DistanceRequest):
                     location["location_type"]
             },
 
-        "distance":
+        "route":
             {
-                "kilometers":
-                    route["distance_km"],
-
-                "meters":
+                "distance_meters":
                     route["distance_meters"],
 
                 "estimated_duration":
                     route["duration"]
             },
 
-        "delivery":
-            pricing
+        "pricing":
+            {
+                "rate_per_kg_km":
+                    pricing["rate_per_kg_km"],
+
+                "calculation":
+                    pricing["calculation"],
+
+                "is_placeholder":
+                    pricing["is_placeholder"]
+            }
     }
