@@ -19,6 +19,7 @@ load_dotenv()
 # ============================================================
 
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+SQUARESPACE_API_KEY = os.getenv("SQUARESPACE_API_KEY")
 
 ORIGIN_LATITUDE = float(
     os.getenv("ORIGIN_LATITUDE", "11.3410")
@@ -586,6 +587,99 @@ def health():
                     True
             }
     }
+
+# ============================================================
+# TEMPORARY SQUARESPACE PRODUCT API TEST
+#
+# This endpoint is only for testing whether Squarespace
+# exposes the product/variant shipping weight.
+#
+# Remove or disable this endpoint after testing.
+# ============================================================
+
+@app.get("/test-squarespace-product")
+def test_squarespace_product():
+
+    if not SQUARESPACE_API_KEY:
+
+        raise HTTPException(
+            status_code=500,
+            detail="SQUARESPACE_API_KEY is not configured"
+        )
+
+    # Product currently present in the test cart
+    product_id = "6821b4f8f9c8016586fe29da"
+
+    url = (
+        "https://api.squarespace.com/"
+        "v2/commerce/products/"
+        + product_id
+    )
+
+    headers = {
+        "Authorization":
+            f"Bearer {SQUARESPACE_API_KEY}",
+
+        "User-Agent":
+            "E-Commerce Delivery Charge Calculator/1.0",
+
+        "Content-Type":
+            "application/json"
+    }
+
+    try:
+
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=15
+        )
+
+        print()
+        print("=" * 60)
+        print("SQUARESPACE PRODUCTS API")
+        print("=" * 60)
+        print("HTTP status:", response.status_code)
+        print("Response:", response.text)
+        print("=" * 60)
+        print()
+
+        response.raise_for_status()
+
+        return {
+            "status_code":
+                response.status_code,
+
+            "response":
+                response.json()
+        }
+
+    except requests.RequestException as exc:
+
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message":
+                    "Squarespace Products API request failed",
+
+                "error":
+                    str(exc),
+
+                "squarespace_http_status":
+                    (
+                        response.status_code
+                        if "response" in locals()
+                        else None
+                    ),
+
+                "squarespace_response":
+                    (
+                        response.text
+                        if "response" in locals()
+                        else None
+                    )
+            }
+        )
 
 
 # ============================================================
