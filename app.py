@@ -681,6 +681,141 @@ def test_squarespace_product():
             }
         )
 
+@app.post("/calculate-cart-weight")
+def calculate_cart_weight(items: list[dict]):
+
+    if not SQUARESPACE_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="SQUARESPACE_API_KEY is not configured"
+        )
+
+    total_weight_kg = 0.0
+    item_results = []
+
+    headers = {
+        "Authorization": f"Bearer {SQUARESPACE_API_KEY}",
+        "User-Agent": "E-Commerce Delivery Charge Calculator/1.0",
+        "Content-Type": "application/json",
+    }
+
+    for item in items:
+
+        product_id = item.get("productId")
+        variant_id = item.get("variantId")
+        quantity = item.get("quantity", 1)
+
+        if not product_id or not variant_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Each item must contain productId and variantId"
+            )
+
+        url = (
+            "https://api.squarespace.com/"
+            "v2/commerce/products/"
+            + product_id
+        )
+
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=15
+            )
+
+            response.raise_for_status()
+
+            product_data = response.json()
+
+        except requests.RequestException as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "Failed to retrieve product from Squarespace",
+                    "product_id": product_id,
+                    "error": str(exc),
+                }
+            )
+
+        products = product_data.get("products", [])
+
+        if not products:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Product {product_id} was not found"
+            )
+
+        product = products[0]
+
+        variants = product.get("variants", [])
+
+        matching_variant = None
+
+        for variant in variants:
+            if variant.get("id") == variant_id:
+                matching_variant = variant
+                break
+
+        if not matching_variant:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "message": "Variant was not found",
+                    "product_id": product_id,
+                    "variant_id": variant_id,
+                }
+            )
+
+        shipping_measurements = matching_variant.get(
+            "shippingMeasurements",
+            {}
+        )
+
+        weight_data = shipping_measurements.get("weight")
+
+        if not weight_data:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "No shipping weight found for variant",
+                    "product_id": product_id,
+                    "variant_id": variant_id,
+                }
+            )
+
+        weight = float(weight_data.get("value", 0))
+        unit = weight_data.get("unit")
+
+        if unit != "KILOGRAM":
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Unsupported weight unit",
+                    "unit": unit,
+                    "product_id": product_id,
+                    "variant_id": variant_id,
+                }
+            )
+
+        item_total_weight = weight * quantity
+
+        total_weight_kg += item_total_weight
+
+        item_results.append({
+            "product_id": product_id,
+            "variant_id": variant_id,
+            "product_name": product.get("name"),
+            "quantity": quantity,
+            "weight_per_unit_kg": weight,
+            "total_weight_kg": item_total_weight,
+        })
+
+    return {
+        "total_weight_kg": round(total_weight_kg, 3),
+        "items": item_results,
+    }
+
 
 # ============================================================
 # DELIVERY CALCULATION ENDPOINT
