@@ -36,14 +36,51 @@ ORIGIN_NAME = os.getenv(
 
 
 # ============================================================
-# PLACEHOLDER PRICING
+# CONFIGURABLE PRICING AND SERVICEABILITY
 #
-# IMPORTANT:
-# This is NOT a real delivery rate.
-# Replace it with the actual pricing model later.
+# Defaults preserve the existing test behaviour. The default
+# pricing formula is a PLACEHOLDER, not a real transport rate.
+# Configure these values in Railway Variables when the business
+# supplies verified pricing and delivery-coverage information.
 # ============================================================
 
-PLACEHOLDER_RATE_PER_KG_KM = 0.50
+PRICING_MODE = os.getenv(
+    "PRICING_MODE", "placeholder_distance_weight"
+).strip().lower()
+
+PLACEHOLDER_RATE_PER_KG_KM = float(
+    os.getenv("PLACEHOLDER_RATE_PER_KG_KM", "0.50")
+)
+BASE_CHARGE_INR = float(os.getenv("BASE_CHARGE_INR", "0"))
+RATE_PER_KM_INR = float(os.getenv("RATE_PER_KM_INR", "0"))
+RATE_PER_KG_INR = float(os.getenv("RATE_PER_KG_INR", "0"))
+RATE_PER_KG_KM_INR = float(os.getenv("RATE_PER_KG_KM_INR", "0"))
+MINIMUM_CHARGE_INR = float(os.getenv("MINIMUM_CHARGE_INR", "0"))
+
+# Supported modes:
+# - unrestricted: do not block any PIN; coverage is NOT verified
+# - allowlist: only PINs in SERVICEABLE_PINCODES are accepted
+# - denylist: PINs in BLOCKED_PINCODES are rejected
+SERVICEABILITY_MODE = os.getenv(
+    "SERVICEABILITY_MODE", "unrestricted"
+).strip().lower()
+
+
+def parse_pincode_set(env_name: str) -> set[str]:
+    """Parse comma-separated six-digit PIN codes from an environment variable."""
+    raw_value = os.getenv(env_name, "")
+    return {
+        item.strip()
+        for item in raw_value.split(",")
+        if item.strip()
+    }
+
+
+SERVICEABLE_PINCODES = parse_pincode_set("SERVICEABLE_PINCODES")
+BLOCKED_PINCODES = parse_pincode_set("BLOCKED_PINCODES")
+MANUAL_CONFIRMATION_PINCODES = parse_pincode_set(
+    "MANUAL_CONFIRMATION_PINCODES"
+)
 
 
 # ============================================================
@@ -454,46 +491,157 @@ def calculate_delivery_charge(
     distance_km: float,
     weight_kg: float
 ):
+    """Calculate a charge using the configured pricing mode.
 
-    # --------------------------------------------------------
-    # PLACEHOLDER FORMULA
-    #
-    # charge = distance × weight × rate
-    #
-    # Example:
-    #
-    # 100 km × 500 kg × ₹0.50
-    # = ₹25,000
-    #
-    # --------------------------------------------------------
+    All non-placeholder modes are configurable frameworks only; do not
+    enable them until the business has confirmed the relevant rates.
+    """
+    if PRICING_MODE == "placeholder_distance_weight":
+        raw_charge = (
+            distance_km * weight_kg * PLACEHOLDER_RATE_PER_KG_KM
+        )
+        calculation = (
+            f"{distance_km} km × {weight_kg} kg × "
+            f"₹{PLACEHOLDER_RATE_PER_KG_KM}/kg/km (PLACEHOLDER)"
+        )
+        rate_per_kg_km = PLACEHOLDER_RATE_PER_KG_KM
+        is_placeholder = True
 
-    charge = (
-        distance_km
-        * weight_kg
-        * PLACEHOLDER_RATE_PER_KG_KM
-    )
+    elif PRICING_MODE == "flat_rate":
+        raw_charge = BASE_CHARGE_INR
+        calculation = f"Flat charge: ₹{BASE_CHARGE_INR}"
+        rate_per_kg_km = None
+        is_placeholder = False
+
+    elif PRICING_MODE == "distance_only":
+        raw_charge = BASE_CHARGE_INR + distance_km * RATE_PER_KM_INR
+        calculation = (
+            f"₹{BASE_CHARGE_INR} base + {distance_km} km × "
+            f"₹{RATE_PER_KM_INR}/km"
+        )
+        rate_per_kg_km = None
+        is_placeholder = False
+
+    elif PRICING_MODE == "weight_only":
+        raw_charge = BASE_CHARGE_INR + weight_kg * RATE_PER_KG_INR
+        calculation = (
+            f"₹{BASE_CHARGE_INR} base + {weight_kg} kg × "
+            f"₹{RATE_PER_KG_INR}/kg"
+        )
+        rate_per_kg_km = None
+        is_placeholder = False
+
+    elif PRICING_MODE == "hybrid":
+        raw_charge = (
+            BASE_CHARGE_INR
+            + distance_km * RATE_PER_KM_INR
+            + weight_kg * RATE_PER_KG_INR
+            + distance_km * weight_kg * RATE_PER_KG_KM_INR
+        )
+        calculation = (
+            f"₹{BASE_CHARGE_INR} base + {distance_km} km × "
+            f"₹{RATE_PER_KM_INR}/km + {weight_kg} kg × "
+            f"₹{RATE_PER_KG_INR}/kg + distance-weight component"
+        )
+        rate_per_kg_km = RATE_PER_KG_KM_INR
+        is_placeholder = False
+
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Unsupported PRICING_MODE configuration",
+                "configured_mode": PRICING_MODE,
+                "supported_modes": [
+                    "placeholder_distance_weight",
+                    "flat_rate",
+                    "distance_only",
+                    "weight_only",
+                    "hybrid",
+                ],
+            },
+        )
+
+    charge = max(raw_charge, MINIMUM_CHARGE_INR)
+
+    if MINIMUM_CHARGE_INR > 0 and charge > raw_charge:
+        calculation += f"; minimum charge ₹{MINIMUM_CHARGE_INR} applied"
 
     return {
-
-        "delivery_charge":
-            round(charge, 2),
-
-        "currency":
-            "INR",
-
-        "is_placeholder":
-            True,
-
-        "rate_per_kg_km":
-            PLACEHOLDER_RATE_PER_KG_KM,
-
-        "calculation":
-            (
-                f"{distance_km} km × "
-                f"{weight_kg} kg × "
-                f"₹{PLACEHOLDER_RATE_PER_KG_KM}/kg/km"
-            )
+        "delivery_charge": round(charge, 2),
+        "currency": "INR",
+        "is_placeholder": is_placeholder,
+        "pricing_mode": PRICING_MODE,
+        "rate_per_kg_km": rate_per_kg_km,
+        "calculation": calculation,
     }
+
+
+def check_pincode_serviceability(pincode: str) -> dict:
+    """Apply configured PIN rules; unrestricted mode does not verify coverage."""
+    if pincode in MANUAL_CONFIRMATION_PINCODES:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MANUAL_DELIVERY_CONFIRMATION_REQUIRED",
+                "pincode": pincode,
+                "message": (
+                    "Delivery to this PIN code requires confirmation. "
+                    "Please contact the business before placing the order."
+                ),
+            },
+        )
+
+    if SERVICEABILITY_MODE == "unrestricted":
+        return {
+            "status": "not_checked",
+            "mode": SERVICEABILITY_MODE,
+            "message": (
+                "Delivery coverage has not been verified. "
+                "This mode is for development/testing only."
+            ),
+        }
+
+    if SERVICEABILITY_MODE == "allowlist":
+        if not SERVICEABLE_PINCODES:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Serviceability is configured as allowlist, but "
+                    "SERVICEABLE_PINCODES is empty."
+                ),
+            )
+        if pincode not in SERVICEABLE_PINCODES:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PIN_NOT_SERVICEABLE",
+                    "pincode": pincode,
+                    "message": "Delivery is not currently available to this PIN code.",
+                },
+            )
+        return {"status": "allowed", "mode": SERVICEABILITY_MODE}
+
+    if SERVICEABILITY_MODE == "denylist":
+        if pincode in BLOCKED_PINCODES:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PIN_NOT_SERVICEABLE",
+                    "pincode": pincode,
+                    "message": "Delivery is not currently available to this PIN code.",
+                },
+            )
+        return {"status": "not_blocked", "mode": SERVICEABILITY_MODE}
+
+    raise HTTPException(
+        status_code=500,
+        detail={
+            "message": "Unsupported SERVICEABILITY_MODE configuration",
+            "configured_mode": SERVICEABILITY_MODE,
+            "supported_modes": ["unrestricted", "allowlist", "denylist"],
+        },
+    )
 
 
 # ============================================================
@@ -526,14 +674,21 @@ def home():
                     ORIGIN_LONGITUDE
             },
 
-        "pricing":
-            {
-                "rate_per_kg_km":
-                    PLACEHOLDER_RATE_PER_KG_KM,
-
-                "placeholder":
-                    True
-            },
+        "pricing": {
+            "mode": PRICING_MODE,
+            "rate_per_kg_km": PLACEHOLDER_RATE_PER_KG_KM
+                if PRICING_MODE == "placeholder_distance_weight" else None,
+            "placeholder": PRICING_MODE == "placeholder_distance_weight",
+            "minimum_charge_inr": MINIMUM_CHARGE_INR,
+        },
+        "serviceability": {
+            "mode": SERVICEABILITY_MODE,
+            "coverage_rules_configured": (
+                (SERVICEABILITY_MODE == "allowlist" and bool(SERVICEABLE_PINCODES))
+                or (SERVICEABILITY_MODE == "denylist" and bool(BLOCKED_PINCODES))
+            ),
+            "manual_confirmation_pin_count": len(MANUAL_CONFIRMATION_PINCODES),
+        },
 
         "endpoints":
             {
@@ -542,6 +697,9 @@ def home():
 
                 "calculate_delivery":
                     "POST /calculate-delivery",
+
+                "calculate_cart_weight":
+                    "POST /calculate-cart-weight",
 
                 "documentation":
                     "/docs"
@@ -578,108 +736,23 @@ def health():
                     ORIGIN_LONGITUDE
             },
 
-        "pricing":
-            {
-                "rate":
-                    PLACEHOLDER_RATE_PER_KG_KM,
-
-                "placeholder":
-                    True
-            }
-    }
-
-# ============================================================
-# TEMPORARY SQUARESPACE PRODUCT API TEST
-#
-# This endpoint is only for testing whether Squarespace
-# exposes the product/variant shipping weight.
-#
-# Remove or disable this endpoint after testing.
-# ============================================================
-
-@app.get("/test-squarespace-product")
-def test_squarespace_product():
-
-    if not SQUARESPACE_API_KEY:
-
-        raise HTTPException(
-            status_code=500,
-            detail="SQUARESPACE_API_KEY is not configured"
-        )
-
-    # Product currently present in the test cart
-    product_id = "6821b4f8f9c8016586fe29da"
-
-    url = (
-        "https://api.squarespace.com/"
-        "v2/commerce/products/"
-        + product_id
-    )
-
-    headers = {
-        "Authorization":
-            f"Bearer {SQUARESPACE_API_KEY}",
-
-        "User-Agent":
-            "E-Commerce Delivery Charge Calculator/1.0",
-
-        "Content-Type":
-            "application/json"
-    }
-
-    try:
-
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=15
-        )
-
-        print()
-        print("=" * 60)
-        print("SQUARESPACE PRODUCTS API")
-        print("=" * 60)
-        print("HTTP status:", response.status_code)
-        print("Response:", response.text)
-        print("=" * 60)
-        print()
-
-        response.raise_for_status()
-
-        return {
-            "status_code":
-                response.status_code,
-
-            "response":
-                response.json()
+        "pricing": {
+            "mode": PRICING_MODE,
+            "placeholder": PRICING_MODE == "placeholder_distance_weight",
+            "minimum_charge_inr": MINIMUM_CHARGE_INR,
+        },
+        "serviceability": {
+            "mode": SERVICEABILITY_MODE,
+            "coverage_rules_configured": (
+                (SERVICEABILITY_MODE == "allowlist" and bool(SERVICEABLE_PINCODES))
+                or (SERVICEABILITY_MODE == "denylist" and bool(BLOCKED_PINCODES))
+            ),
         }
+    }
 
-    except requests.RequestException as exc:
-
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message":
-                    "Squarespace Products API request failed",
-
-                "error":
-                    str(exc),
-
-                "squarespace_http_status":
-                    (
-                        response.status_code
-                        if "response" in locals()
-                        else None
-                    ),
-
-                "squarespace_response":
-                    (
-                        response.text
-                        if "response" in locals()
-                        else None
-                    )
-            }
-        )
+# ============================================================
+# CART WEIGHT CALCULATION
+# ============================================================
 
 @app.post("/calculate-cart-weight")
 def calculate_cart_weight(items: list[dict]):
@@ -859,6 +932,12 @@ def calculate_delivery(request: DeliveryRequest):
         )
 
     # --------------------------------------------------------
+    # STEP 0: SERVICEABILITY RULES
+    # --------------------------------------------------------
+
+    serviceability = check_pincode_serviceability(pincode)
+
+    # --------------------------------------------------------
     # Validate weight
     # --------------------------------------------------------
 
@@ -969,15 +1048,13 @@ def calculate_delivery(request: DeliveryRequest):
                     route["duration"]
             },
 
-        "pricing":
-            {
-                "rate_per_kg_km":
-                    pricing["rate_per_kg_km"],
+        "pricing": {
+            "mode": pricing["pricing_mode"],
+            "rate_per_kg_km": pricing["rate_per_kg_km"],
+            "minimum_charge_inr": MINIMUM_CHARGE_INR,
+            "calculation": pricing["calculation"],
+            "is_placeholder": pricing["is_placeholder"],
+        },
 
-                "calculation":
-                    pricing["calculation"],
-
-                "is_placeholder":
-                    pricing["is_placeholder"]
-            }
+        "serviceability": serviceability
     }
