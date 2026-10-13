@@ -1,7 +1,5 @@
 import os
 import requests
-import smtplib
-from email.message import EmailMessage
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,36 +21,41 @@ load_dotenv()
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 SQUARESPACE_API_KEY = os.getenv("SQUARESPACE_API_KEY")
 
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USERNAME = os.getenv("SMTP_USERNAME")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "JSK Tiles World <onboarding@resend.dev>")
 ORDER_NOTIFICATION_EMAIL = os.getenv("ORDER_NOTIFICATION_EMAIL")
 
 
 def send_order_notification(subject: str, body: str) -> None:
-    """Send an order notification through configured Gmail SMTP."""
+    """Send an order notification through Resend's HTTPS API."""
     required_settings = {
-        "SMTP_USERNAME": SMTP_USERNAME,
-        "SMTP_PASSWORD": SMTP_PASSWORD,
+        "RESEND_API_KEY": RESEND_API_KEY,
+        "EMAIL_FROM": EMAIL_FROM,
         "ORDER_NOTIFICATION_EMAIL": ORDER_NOTIFICATION_EMAIL,
     }
     missing = [name for name, value in required_settings.items() if not value]
     if missing:
+        raise RuntimeError("Missing email configuration: " + ", ".join(missing))
+
+    response = requests.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": EMAIL_FROM,
+            "to": [ORDER_NOTIFICATION_EMAIL],
+            "subject": subject,
+            "text": body,
+        },
+        timeout=20,
+    )
+    if not response.ok:
+        # Log provider status and response without logging the API key.
         raise RuntimeError(
-            "Missing email configuration: " + ", ".join(missing)
+            f"Resend API returned HTTP {response.status_code}: {response.text[:1000]}"
         )
-
-    message = EmailMessage()
-    message["Subject"] = subject
-    message["From"] = SMTP_USERNAME
-    message["To"] = ORDER_NOTIFICATION_EMAIL
-    message.set_content(body)
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-        server.starttls()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.send_message(message)
 
 
 ORIGIN_LATITUDE = float(
