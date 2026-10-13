@@ -1,5 +1,7 @@
 import os
 import requests
+import smtplib
+from email.message import EmailMessage
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,6 +22,38 @@ load_dotenv()
 
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 SQUARESPACE_API_KEY = os.getenv("SQUARESPACE_API_KEY")
+
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+ORDER_NOTIFICATION_EMAIL = os.getenv("ORDER_NOTIFICATION_EMAIL")
+
+
+def send_order_notification(subject: str, body: str) -> None:
+    """Send an order notification through configured Gmail SMTP."""
+    required_settings = {
+        "SMTP_USERNAME": SMTP_USERNAME,
+        "SMTP_PASSWORD": SMTP_PASSWORD,
+        "ORDER_NOTIFICATION_EMAIL": ORDER_NOTIFICATION_EMAIL,
+    }
+    missing = [name for name, value in required_settings.items() if not value]
+    if missing:
+        raise RuntimeError(
+            "Missing email configuration: " + ", ".join(missing)
+        )
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = SMTP_USERNAME
+    message["To"] = ORDER_NOTIFICATION_EMAIL
+    message.set_content(body)
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+        server.starttls()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.send_message(message)
+
 
 ORIGIN_LATITUDE = float(
     os.getenv("ORIGIN_LATITUDE", "11.3410")
@@ -137,6 +171,21 @@ class DeliveryRequest(BaseModel):
         description="Total shipment weight in kilograms",
         examples=[154]
     )
+
+
+class OrderItem(BaseModel):
+    productId: str = Field(..., min_length=1)
+    variantId: str = Field(..., min_length=1)
+    quantity: int = Field(..., gt=0, le=1000)
+
+
+class OrderRequest(BaseModel):
+    customer_name: str = Field(..., min_length=1, max_length=150)
+    customer_email: str = Field(..., min_length=3, max_length=254)
+    customer_phone: str = Field(..., min_length=5, max_length=30)
+    delivery_address: str = Field(..., min_length=5, max_length=1000)
+    pincode: str = Field(..., min_length=6, max_length=6)
+    items: list[OrderItem] = Field(..., min_length=1, max_length=100)
 
 
 # ============================================================
@@ -1057,4 +1106,116 @@ def calculate_delivery(request: DeliveryRequest):
         },
 
         "serviceability": serviceability
+    }
+
+
+# ============================================================
+# ORDER REQUEST SUBMISSION
+# ============================================================
+
+@app.post("/submit-order-request")
+def submit_order_request(request: OrderRequest):
+    """Validate cart data, recalculate delivery, and email the request."""
+    customer_name = request.customer_name.strip()
+    customer_email = request.customer_email.strip()
+    customer_phone = request.customer_phone.strip()
+    delivery_address = request.delivery_address.strip()
+    pincode = request.pincode.strip()
+
+    if not customer_name or not customer_email or not customer_phone or not delivery_address:
+        raise HTTPException(
+            status_code=400,
+            detail="Please complete all required customer and delivery fields."
+        )
+
+    # Basic email validation; the business will confirm the request manually.
+    if "@" not in customer_email or "." not in customer_email.rsplit("@", 1)[-1]:
+        raise HTTPException(status_code=400, detail="Please provide a valid email address.")
+
+    if not pincode.isdigit() or len(pincode) != 6:
+        raise HTTPException(status_code=400, detail="PIN code must contain exactly 6 digits.")
+
+    cart_items = [
+        {"productId": item.productId, "variantId": item.variantId, "quantity": item.quantity}
+        for item in request.items
+    ]
+
+    # This existing endpoint function looks up products and weights via Squarespace.
+    cart_data = calculate_cart_weight(cart_items)
+    total_weight = float(cart_data["total_weight_kg"])
+
+    if total_weight <= 0:
+        raise HTTPException(status_code=400, detail="The shipment weight could not be verified.")
+
+    delivery_data = calculate_delivery(
+        DeliveryRequest(pincode=pincode, weight_kg=total_weight)
+    )
+
+    lines = [
+        "NEW ORDER REQUEST — JSK TILES WORLD",
+        "",
+        "CUSTOMER DETAILS",
+        f"Name: {customer_name}",
+        f"Email: {customer_email}",
+        f"Phone: {customer_phone}",
+        "",
+        "DELIVERY ADDRESS",
+        delivery_address,
+        f"PIN code: {pincode}",
+        "",
+        "ORDER ITEMS",
+    ]
+
+    for item in cart_data["items"]:
+        lines.extend([
+            f"- {item.get('product_name') or 'Product'}",
+            f"  Quantity: {item['quantity']}",
+            f"  Unit weight: {float(item['weight_per_unit_kg']):.2f} kg",
+            f"  Item weight: {float(item['total_weight_kg']):.2f} kg",
+            f"  Product ID: {item['product_id']}",
+            f"  Variant ID: {item['variant_id']}",
+        ])
+
+    destination = delivery_data.get("destination", {})
+    if isinstance(destination, dict):
+        destination_text = destination.get("formatted_address") or "Not available"
+    else:
+        destination_text = str(destination)
+
+    pricing = delivery_data.get("pricing", {})
+    lines.extend([
+        "",
+        "DELIVERY ESTIMATE — NOT A FINAL QUOTE",
+        f"Total shipment weight: {total_weight:.2f} kg",
+        f"Estimated distance: {delivery_data.get('distance_km')} km",
+        f"Estimated delivery charge: INR {delivery_data.get('delivery_charge')}",
+        f"Destination: {destination_text}",
+        f"Pricing mode: {pricing.get('mode', PRICING_MODE)}",
+        f"Placeholder pricing: {pricing.get('is_placeholder', True)}",
+        "",
+        "ACTION REQUIRED",
+        "Verify stock, delivery coverage and actual transport costs.",
+        "Contact the customer with the confirmed total and payment instructions.",
+        "This is an order request, not a confirmed order. No payment has been collected.",
+    ])
+
+    try:
+        send_order_notification(
+            subject=f"New order request — PIN {pincode}",
+            body="\n".join(lines),
+        )
+    except Exception as exc:
+        # Avoid exposing SMTP credentials or technical details to the customer.
+        print(f"Order notification failed: {type(exc).__name__}: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail="We couldn't send your order request. Please try again or contact JSK Tiles World."
+        )
+
+    return {
+        "success": True,
+        "message": "Your order request has been submitted. JSK Tiles World will contact you to confirm the final cost.",
+        "total_weight_kg": total_weight,
+        "delivery_estimate": delivery_data.get("delivery_charge"),
+        "estimate_only": True,
     }
