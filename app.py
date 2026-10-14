@@ -1,4 +1,5 @@
 import os
+import uuid
 import requests
 
 from fastapi import FastAPI, HTTPException
@@ -26,12 +27,11 @@ EMAIL_FROM = os.getenv("EMAIL_FROM", "JSK Tiles World <onboarding@resend.dev>")
 ORDER_NOTIFICATION_EMAIL = os.getenv("ORDER_NOTIFICATION_EMAIL")
 
 
-def send_order_notification(subject: str, body: str) -> None:
-    """Send an order notification through Resend's HTTPS API."""
+def send_email(recipient: str, subject: str, body: str) -> None:
+    """Send a plain-text email through Resend's HTTPS API."""
     required_settings = {
         "RESEND_API_KEY": RESEND_API_KEY,
         "EMAIL_FROM": EMAIL_FROM,
-        "ORDER_NOTIFICATION_EMAIL": ORDER_NOTIFICATION_EMAIL,
     }
     missing = [name for name, value in required_settings.items() if not value]
     if missing:
@@ -45,7 +45,7 @@ def send_order_notification(subject: str, body: str) -> None:
         },
         json={
             "from": EMAIL_FROM,
-            "to": [ORDER_NOTIFICATION_EMAIL],
+            "to": [recipient],
             "subject": subject,
             "text": body,
         },
@@ -1154,8 +1154,11 @@ def submit_order_request(request: OrderRequest):
         DeliveryRequest(pincode=pincode, weight_kg=total_weight)
     )
 
+    order_reference = "JSK-" + uuid.uuid4().hex[:10].upper()
+
     lines = [
         "NEW ORDER REQUEST — JSK TILES WORLD",
+        f"Order reference: {order_reference}",
         "",
         "CUSTOMER DETAILS",
         f"Name: {customer_name}",
@@ -1202,9 +1205,16 @@ def submit_order_request(request: OrderRequest):
         "This is an order request, not a confirmed order. No payment has been collected.",
     ])
 
+    if not ORDER_NOTIFICATION_EMAIL:
+        raise HTTPException(
+            status_code=500,
+            detail="Order notification email is not configured on the server."
+        )
+
     try:
-        send_order_notification(
-            subject=f"New order request — PIN {pincode}",
+        send_email(
+            recipient=ORDER_NOTIFICATION_EMAIL,
+            subject=f"New order request {order_reference} — PIN {pincode}",
             body="\n".join(lines),
         )
     except Exception as exc:
@@ -1215,9 +1225,61 @@ def submit_order_request(request: OrderRequest):
             detail="We couldn't send your order request. Please try again or contact JSK Tiles World."
         )
 
+    # Send a separate acknowledgment to the customer. A customer-email failure
+    # should not turn a successfully delivered business notification into a
+    # failed submission that encourages duplicate requests.
+    item_lines = []
+    for item in cart_data["items"]:
+        item_lines.append(
+            f"- {item.get('product_name') or 'Product'} — quantity {item['quantity']}"
+        )
+        item_lines.append(
+            f"  Weight: {float(item['total_weight_kg']):.2f} kg total"
+        )
+
+    acknowledgment_body = "\n".join([
+        f"Hello {customer_name},",
+        "",
+        "Thank you for contacting JSK Tiles World. We have received your order request.",
+        "",
+        f"Order reference: {order_reference}",
+        "",
+        "REQUEST SUMMARY",
+        *item_lines,
+        "",
+        f"Delivery PIN code: {pincode}",
+        f"Total shipment weight: {total_weight:.2f} kg",
+        "",
+        "IMPORTANT — THIS IS NOT AN ORDER CONFIRMATION",
+        "Your request is pending review. We will check product availability, delivery coverage, and the actual transport charge, then contact you with the final delivery charges and payment instructions.",
+        "The delivery amount shown during submission is only an estimate. No payment has been collected, and your order is not confirmed until JSK Tiles World confirms it with you.",
+        "",
+        "If you have questions, please reply to this email or contact JSK Tiles World.",
+        "",
+        "Regards,",
+        "JSK Tiles World",
+    ])
+
+    acknowledgment_sent = True
+    try:
+        send_email(
+            recipient=customer_email,
+            subject=f"We received your order request — {order_reference}",
+            body=acknowledgment_body,
+        )
+    except Exception as exc:
+        acknowledgment_sent = False
+        print(f"Customer acknowledgment email failed for {order_reference}: {type(exc).__name__}: {exc}")
+
     return {
         "success": True,
-        "message": "Your order request has been submitted. JSK Tiles World will contact you to confirm the final cost.",
+        "order_reference": order_reference,
+        "acknowledgment_email_sent": acknowledgment_sent,
+        "message": (
+            f"Your order request was submitted successfully. Reference: {order_reference}. "
+            + ("An acknowledgment email has been sent to your email address. " if acknowledgment_sent else "We received your request, but couldn't send the acknowledgment email. Please save your order reference. ")
+            + "This is not an order confirmation; JSK Tiles World will contact you to confirm availability, final delivery charges and payment instructions."
+        ),
         "total_weight_kg": total_weight,
         "delivery_estimate": delivery_data.get("delivery_charge"),
         "estimate_only": True,
