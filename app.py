@@ -1,5 +1,8 @@
 import os
 import uuid
+import json
+import sqlite3
+from datetime import datetime, timezone
 import requests
 
 from fastapi import FastAPI, HTTPException
@@ -25,6 +28,84 @@ SQUARESPACE_API_KEY = os.getenv("SQUARESPACE_API_KEY")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "JSK Tiles World <onboarding@resend.dev>")
 ORDER_NOTIFICATION_EMAIL = os.getenv("ORDER_NOTIFICATION_EMAIL")
+
+# SQLite database stored on the Railway Volume mounted at /data.
+ORDERS_DB_PATH = os.getenv("ORDERS_DB_PATH", "/data/orders.db")
+
+
+def get_orders_db():
+    """Open the persistent order database and ensure its schema exists."""
+    parent = os.path.dirname(ORDERS_DB_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    connection = sqlite3.connect(ORDERS_DB_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            order_reference TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Pending review',
+            customer_name TEXT NOT NULL,
+            customer_email TEXT NOT NULL,
+            customer_phone TEXT NOT NULL,
+            delivery_address TEXT NOT NULL,
+            pincode TEXT NOT NULL,
+            items_json TEXT NOT NULL,
+            total_weight_kg REAL NOT NULL,
+            delivery_distance_km REAL,
+            delivery_estimate_inr REAL,
+            estimate_only INTEGER NOT NULL DEFAULT 1,
+            pricing_mode TEXT,
+            destination_text TEXT,
+            business_notification_sent INTEGER NOT NULL DEFAULT 0,
+            acknowledgment_email_sent INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    connection.commit()
+    return connection
+
+
+def save_order_record(order: dict) -> None:
+    """Persist the order request before attempting any email delivery."""
+    with get_orders_db() as connection:
+        connection.execute("""
+            INSERT INTO orders (
+                order_reference, created_at, status, customer_name,
+                customer_email, customer_phone, delivery_address, pincode,
+                items_json, total_weight_kg, delivery_distance_km,
+                delivery_estimate_inr, estimate_only, pricing_mode,
+                destination_text, business_notification_sent,
+                acknowledgment_email_sent
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            order["order_reference"], order["created_at"], order["status"],
+            order["customer_name"], order["customer_email"], order["customer_phone"],
+            order["delivery_address"], order["pincode"], json.dumps(order["items"]),
+            order["total_weight_kg"], order["delivery_distance_km"],
+            order["delivery_estimate_inr"], 1, order["pricing_mode"],
+            order["destination_text"], 0, 0
+        ))
+
+
+def update_order_email_status(order_reference: str, *, business_sent=None, acknowledgment_sent=None) -> None:
+    """Record email delivery attempts without changing the order's status."""
+    assignments = []
+    values = []
+    if business_sent is not None:
+        assignments.append("business_notification_sent = ?")
+        values.append(1 if business_sent else 0)
+    if acknowledgment_sent is not None:
+        assignments.append("acknowledgment_email_sent = ?")
+        values.append(1 if acknowledgment_sent else 0)
+    if not assignments:
+        return
+    values.append(order_reference)
+    with get_orders_db() as connection:
+        connection.execute(
+            f"UPDATE orders SET {', '.join(assignments)} WHERE order_reference = ?",
+            values,
+        )
 
 
 def send_email(recipient: str, subject: str, body: str) -> None:
@@ -1118,7 +1199,7 @@ def calculate_delivery(request: DeliveryRequest):
 
 @app.post("/submit-order-request")
 def submit_order_request(request: OrderRequest):
-    """Validate cart data, recalculate delivery, and email the request."""
+    """Validate, persist, and email an order request."""
     customer_name = request.customer_name.strip()
     customer_email = request.customer_email.strip()
     customer_phone = request.customer_phone.strip()
@@ -1126,15 +1207,9 @@ def submit_order_request(request: OrderRequest):
     pincode = request.pincode.strip()
 
     if not customer_name or not customer_email or not customer_phone or not delivery_address:
-        raise HTTPException(
-            status_code=400,
-            detail="Please complete all required customer and delivery fields."
-        )
-
-    # Basic email validation; the business will confirm the request manually.
+        raise HTTPException(status_code=400, detail="Please complete all required customer and delivery fields.")
     if "@" not in customer_email or "." not in customer_email.rsplit("@", 1)[-1]:
         raise HTTPException(status_code=400, detail="Please provide a valid email address.")
-
     if not pincode.isdigit() or len(pincode) != 6:
         raise HTTPException(status_code=400, detail="PIN code must contain exactly 6 digits.")
 
@@ -1142,19 +1217,46 @@ def submit_order_request(request: OrderRequest):
         {"productId": item.productId, "variantId": item.variantId, "quantity": item.quantity}
         for item in request.items
     ]
-
-    # This existing endpoint function looks up products and weights via Squarespace.
     cart_data = calculate_cart_weight(cart_items)
     total_weight = float(cart_data["total_weight_kg"])
-
     if total_weight <= 0:
         raise HTTPException(status_code=400, detail="The shipment weight could not be verified.")
 
-    delivery_data = calculate_delivery(
-        DeliveryRequest(pincode=pincode, weight_kg=total_weight)
-    )
-
+    delivery_data = calculate_delivery(DeliveryRequest(pincode=pincode, weight_kg=total_weight))
     order_reference = "JSK-" + uuid.uuid4().hex[:10].upper()
+
+    destination = delivery_data.get("destination", {})
+    if isinstance(destination, dict):
+        destination_text = destination.get("formatted_address") or "Not available"
+    else:
+        destination_text = str(destination)
+    pricing = delivery_data.get("pricing", {})
+
+    # Save the order before attempting email delivery. Email failures must not
+    # discard the request or cause the customer to needlessly resubmit it.
+    try:
+        save_order_record({
+            "order_reference": order_reference,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": "Pending review",
+            "customer_name": customer_name,
+            "customer_email": customer_email,
+            "customer_phone": customer_phone,
+            "delivery_address": delivery_address,
+            "pincode": pincode,
+            "items": cart_data["items"],
+            "total_weight_kg": total_weight,
+            "delivery_distance_km": delivery_data.get("distance_km"),
+            "delivery_estimate_inr": delivery_data.get("delivery_charge"),
+            "pricing_mode": pricing.get("mode", PRICING_MODE),
+            "destination_text": destination_text,
+        })
+    except Exception as exc:
+        print(f"Order persistence failed for {order_reference}: {type(exc).__name__}: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail="We couldn't securely save your order request. Please try again or contact JSK Tiles World.",
+        )
 
     lines = [
         "NEW ORDER REQUEST — JSK TILES WORLD",
@@ -1171,7 +1273,6 @@ def submit_order_request(request: OrderRequest):
         "",
         "ORDER ITEMS",
     ]
-
     for item in cart_data["items"]:
         lines.extend([
             f"- {item.get('product_name') or 'Product'}",
@@ -1181,14 +1282,6 @@ def submit_order_request(request: OrderRequest):
             f"  Product ID: {item['product_id']}",
             f"  Variant ID: {item['variant_id']}",
         ])
-
-    destination = delivery_data.get("destination", {})
-    if isinstance(destination, dict):
-        destination_text = destination.get("formatted_address") or "Not available"
-    else:
-        destination_text = str(destination)
-
-    pricing = delivery_data.get("pricing", {})
     lines.extend([
         "",
         "DELIVERY ESTIMATE — NOT A FINAL QUOTE",
@@ -1205,38 +1298,26 @@ def submit_order_request(request: OrderRequest):
         "This is an order request, not a confirmed order. No payment has been collected.",
     ])
 
+    business_notification_sent = False
     if not ORDER_NOTIFICATION_EMAIL:
-        raise HTTPException(
-            status_code=500,
-            detail="Order notification email is not configured on the server."
-        )
+        print(f"Order notification email is not configured for {order_reference}.")
+    else:
+        try:
+            send_email(
+                recipient=ORDER_NOTIFICATION_EMAIL,
+                subject=f"New order request {order_reference} — PIN {pincode}",
+                body="\n".join(lines),
+            )
+            business_notification_sent = True
+            update_order_email_status(order_reference, business_sent=True)
+        except Exception as exc:
+            print(f"Order notification failed for {order_reference}: {type(exc).__name__}: {exc}")
+            update_order_email_status(order_reference, business_sent=False)
 
-    try:
-        send_email(
-            recipient=ORDER_NOTIFICATION_EMAIL,
-            subject=f"New order request {order_reference} — PIN {pincode}",
-            body="\n".join(lines),
-        )
-    except Exception as exc:
-        # Avoid exposing SMTP credentials or technical details to the customer.
-        print(f"Order notification failed: {type(exc).__name__}: {exc}")
-        raise HTTPException(
-            status_code=502,
-            detail="We couldn't send your order request. Please try again or contact JSK Tiles World."
-        )
-
-    # Send a separate acknowledgment to the customer. A customer-email failure
-    # should not turn a successfully delivered business notification into a
-    # failed submission that encourages duplicate requests.
     item_lines = []
     for item in cart_data["items"]:
-        item_lines.append(
-            f"- {item.get('product_name') or 'Product'} — quantity {item['quantity']}"
-        )
-        item_lines.append(
-            f"  Weight: {float(item['total_weight_kg']):.2f} kg total"
-        )
-
+        item_lines.append(f"- {item.get('product_name') or 'Product'} — quantity {item['quantity']}")
+        item_lines.append(f"  Weight: {float(item['total_weight_kg']):.2f} kg total")
     acknowledgment_body = "\n".join([
         f"Hello {customer_name},",
         "",
@@ -1260,26 +1341,44 @@ def submit_order_request(request: OrderRequest):
         "JSK Tiles World",
     ])
 
-    acknowledgment_sent = True
+    acknowledgment_sent = False
     try:
         send_email(
             recipient=customer_email,
             subject=f"We received your order request — {order_reference}",
             body=acknowledgment_body,
         )
+        acknowledgment_sent = True
+        update_order_email_status(order_reference, acknowledgment_sent=True)
     except Exception as exc:
-        acknowledgment_sent = False
         print(f"Customer acknowledgment email failed for {order_reference}: {type(exc).__name__}: {exc}")
+        update_order_email_status(order_reference, acknowledgment_sent=False)
+
+    if business_notification_sent and acknowledgment_sent:
+        message = (
+            f"Your order request was saved successfully. Reference: {order_reference}. "
+            "An acknowledgment email has been sent. This is not an order confirmation; "
+            "JSK Tiles World will contact you to confirm availability, final delivery charges and payment instructions."
+        )
+    elif business_notification_sent:
+        message = (
+            f"Your order request was saved successfully. Reference: {order_reference}. "
+            "JSK Tiles World has been notified, but we couldn't send the acknowledgment email. "
+            "Please save your reference. This is not an order confirmation."
+        )
+    else:
+        message = (
+            f"Your order request was saved successfully. Reference: {order_reference}, but an email notification could not be sent. "
+            "Please contact JSK Tiles World and provide this reference. This is not an order confirmation."
+        )
 
     return {
         "success": True,
         "order_reference": order_reference,
+        "status": "Pending review",
+        "business_notification_sent": business_notification_sent,
         "acknowledgment_email_sent": acknowledgment_sent,
-        "message": (
-            f"Your order request was submitted successfully. Reference: {order_reference}. "
-            + ("An acknowledgment email has been sent to your email address. " if acknowledgment_sent else "We received your request, but couldn't send the acknowledgment email. Please save your order reference. ")
-            + "This is not an order confirmation; JSK Tiles World will contact you to confirm availability, final delivery charges and payment instructions."
-        ),
+        "message": message,
         "total_weight_kg": total_weight,
         "delivery_estimate": delivery_data.get("delivery_charge"),
         "estimate_only": True,
